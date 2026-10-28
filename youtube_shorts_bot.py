@@ -5,6 +5,7 @@ import discord
 from google import genai
 from discord.ext import commands, tasks
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -30,8 +31,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="yt.", intents=intents, help_command=None)
 
 
+class QuotaExceededError(Exception):
+    pass
+
+
 def generate_search_queries() -> list[str]:
-    """Use Gemini to generate diverse, fresh YouTube search queries."""
     prompt = (
         "Generate 5 unique and creative YouTube search queries for finding "
         "interesting short-form fact videos (YouTube Shorts). Each query should "
@@ -54,7 +58,6 @@ def generate_search_queries() -> list[str]:
 
 
 async def get_posted_video_ids(channel: discord.TextChannel, limit: int = 200) -> set[str]:
-    """Scan the bot's recent messages in the channel to find already-posted video IDs."""
     posted_ids: set[str] = set()
     async for message in channel.history(limit=limit):
         if message.author != bot.user:
@@ -68,18 +71,23 @@ async def get_posted_video_ids(channel: discord.TextChannel, limit: int = 200) -
 
 
 def search_youtube(query: str, max_results: int = 5, duration: str = "any") -> list[dict]:
-    response = (
-        youtube.search()
-        .list(
-            q=query,
-            part="snippet",
-            type="video",
-            videoDuration=duration,
-            order="relevance",
-            maxResults=max_results,
+    try:
+        response = (
+            youtube.search()
+            .list(
+                q=query,
+                part="snippet",
+                type="video",
+                videoDuration=duration,
+                order="relevance",
+                maxResults=max_results,
+            )
+            .execute()
         )
-        .execute()
-    )
+    except HttpError as e:
+        if e.resp.status == 403:
+            raise QuotaExceededError("YouTube API daily quota exceeded. Try again tomorrow.")
+        raise
 
     videos = []
     for item in response.get("items", []):
@@ -110,12 +118,16 @@ def fetch_daily_shorts(posted_ids: set[str], max_results_per_query: int = 5) -> 
     videos: list[dict] = []
 
     for query in queries:
-        for v in search_youtube(query, max_results=max_results_per_query, duration="short"):
-            vid = v["id"]
-            if vid in seen_ids or vid in posted_ids:
-                continue
-            seen_ids.add(vid)
-            videos.append(v)
+        try:
+            for v in search_youtube(query, max_results=max_results_per_query, duration="short"):
+                vid = v["id"]
+                if vid in seen_ids or vid in posted_ids:
+                    continue
+                seen_ids.add(vid)
+                videos.append(v)
+        except QuotaExceededError:
+            print(f"Quota exceeded during query: {query}")
+            break
 
     return videos[:10]
 
@@ -132,17 +144,27 @@ def build_embed(video: dict, index: int = 0) -> discord.Embed:
     return embed
 
 
+QUOTA_MESSAGE = (
+    "⚠️ **YouTube API daily quota exceeded.**\n"
+    "The free tier allows ~100 searches per day. "
+    "Quota resets at midnight Pacific Time. Try again tomorrow!"
+)
+
+
 # --- Commands ---
 
 @bot.command(name="vid")
 async def yt_vid(ctx: commands.Context, *, query: str = None):
-    """Search YouTube and return the top 5 video links."""
     if not query:
         await ctx.send("Please provide a search query. Usage: `yt.vid <search terms>`")
         return
 
     await ctx.send(f"🔍 Searching YouTube for **{query}**...")
-    videos = search_youtube(query, max_results=5, duration="any")
+    try:
+        videos = search_youtube(query, max_results=5, duration="any")
+    except QuotaExceededError:
+        await ctx.send(QUOTA_MESSAGE)
+        return
 
     if not videos:
         await ctx.send("No videos found for that query.")
@@ -157,13 +179,16 @@ async def yt_vid(ctx: commands.Context, *, query: str = None):
 
 @bot.command(name="short")
 async def yt_short(ctx: commands.Context, *, query: str = None):
-    """Search YouTube Shorts and return the top 5 short links."""
     if not query:
         await ctx.send("Please provide a search query. Usage: `yt.short <search terms>`")
         return
 
     await ctx.send(f"🔍 Searching YouTube Shorts for **{query}**...")
-    videos = search_youtube(query, max_results=5, duration="short")
+    try:
+        videos = search_youtube(query, max_results=5, duration="short")
+    except QuotaExceededError:
+        await ctx.send(QUOTA_MESSAGE)
+        return
 
     if not videos:
         await ctx.send("No shorts found for that query.")
@@ -178,7 +203,6 @@ async def yt_short(ctx: commands.Context, *, query: str = None):
 
 @bot.command(name="help")
 async def yt_help(ctx: commands.Context):
-    """Show how to use the bot."""
     embed = discord.Embed(
         title="📖 YouTube Bot — Help",
         description="I curate YouTube videos and Shorts for you!",
@@ -224,12 +248,14 @@ async def post_daily_shorts(channel: discord.TextChannel):
 
     header = (
         "🎬 **Daily YouTube Shorts — Random Facts & Life Hacks**\n"
-        "Here are today's top picks:\n"
+        f"Here are today's top {len(videos)} picks:\n"
     )
     await channel.send(header)
     for i, video in enumerate(videos, 1):
         await channel.send(embed=build_embed(video, index=i))
         await asyncio.sleep(0.5)
+
+    print(f"Posted {len(videos)} videos")
 
 
 @tasks.loop(hours=24)
